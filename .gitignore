@@ -1,9 +1,18 @@
 .*.swp
 .*.swo
 output/
+output_pseudo_16384/
+output_old/
+output_max_5/
+output_max_50/
+output_single_run/
+output_test/
+output_wrong/
 env/
 *_env/
 joblog/
+*.tar.gz
+*.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

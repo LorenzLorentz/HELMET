@@ -355,6 +355,7 @@ class TgiVllmModel(OpenAIModel):
         if stop_new_line:
             self.stops = ["\n", "\n\n"]
         
+        import tiktoken
         from openai import OpenAI
         from transformers import AutoTokenizer
         
@@ -374,7 +375,8 @@ class TgiVllmModel(OpenAIModel):
         else:
             print(f"** Model: {model_name}")
             self.model_name = model_name
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.tokenizer = tiktoken.encoding_for_model(model_name)
+            # self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.seed = seed
         self.API_MAX_LENGTH = float('inf')
 
@@ -596,7 +598,7 @@ class GeminiModel(LLM):
             generation_max_length=generation_max_length,
             generation_min_length=generation_min_length,
             do_sample=do_sample,
-            stop_newline=stop_newline,
+            stop_new_line=stop_new_line,
             use_chat_template=use_chat_template,
             system_message=system_message,
         )
@@ -702,7 +704,7 @@ class TogetherModel(LLM):
             generation_max_length=generation_max_length,
             generation_min_length=generation_min_length,
             do_sample=do_sample,
-            stop_newline=stop_newline,
+            stop_new_line=stop_new_line,
             use_chat_template=use_chat_template,
             system_message=system_message,
         )
@@ -859,6 +861,8 @@ class HFModel(LLM):
         use_chat_template=False,
         system_message=None,
         seed=42,
+        _device=None,
+        model_key="",
         **kwargs,
     ):
         super().__init__(
@@ -869,11 +873,13 @@ class HFModel(LLM):
             generation_max_length=generation_max_length,
             generation_min_length=generation_min_length,
             do_sample=do_sample,
-            stop_newline=stop_newline,
+            stop_new_line=stop_new_line,
             use_chat_template=use_chat_template,
             system_message=system_message,
         )
         set_seed(seed)
+
+        self.is_shadowkv = "shadowkv" in model_key
 
         import transformers
         from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -897,28 +903,59 @@ class HFModel(LLM):
         self.tokenizer.truncation_side = "left"
         self.tokenizer.padding_side = "left"
 
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_name)
         if "rope_theta" in kwargs and kwargs["rope_theta"] is not None:
             logger.info(f"Override rope theta to {kwargs['rope_theta']}")
             config.rope_theta = kwargs["rope_theta"]
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            config=config,
-            torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
-            device_map="auto",
-            trust_remote_code=True,
-            **model_kwargs
-        )
-        if kwargs.get("torch_compile", True):
-            self.model = torch.compile(self.model)
+        if "infllmv1" in model_key:
+            import sys
+            sys.path.insert(0, "/home/test/test01/hyx/InfLLM-main")
+            from omegaconf import OmegaConf
+            from inf_llm.utils import patch_hf
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                attn_implementation='sdpa',
+                torch_dtype=torch.bfloat16,
+                device_map=_device if _device else "auto",
+            )
+            inf_config = OmegaConf.load("./infllmv1-128.yaml" if "128" in model_key else "./infllmv1-64.yaml").model
+            self.model = patch_hf(model, inf_config.type, **inf_config)
+        elif "shadowkv" in model_key:
+            import sys
+            sys.path.insert(0, "/home/test/test01/hyx/ShadowKV")
+            from models import Llama
+            self.model = Llama(
+                model_name=model_name,
+                sparse_budget=3072, # local + outliers = 1024
+                attn_mode='shadowkv',
+                rank=40,
+                device=str(_device),
+                chunk_size=8 if "chunk_size=8" in model_key else 64,
+            )
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                config=config,
+                torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
+                device_map=_device if _device else "auto",
+                trust_remote_code=True,
+                **model_kwargs
+            )
+
+        if kwargs.get("torch_compile", True) :
+            try:
+                self.model = torch.compile(self.model)
+            except:
+                pass
             # https://huggingface.co/docs/transformers/en/llm_optims?static-kv=basic+usage%3A+generation_config#static-kv-cache-and-torchcompile
             # self.model.forward = torch.compile(self.model.forward, mode="reduce-overhead", fullgraph=True)
 
         # use the default if possible, append if necessary
-        stop_token_ids = self.model.generation_config.eos_token_id
+        stop_token_ids = self.model.generation_config.eos_token_id if not ("shadowkv" in model_key) else self.tokenizer.eos_token_id
         stop_token_ids = [stop_token_ids] if not isinstance(stop_token_ids, list) else stop_token_ids
-        if stop_newline:
+        if stop_new_line:
             stop = list(set(["\n", "Ċ", "ĊĊ", "<0x0A>"]))
             stop_token_ids = list(set([self.tokenizer.convert_tokens_to_ids(stop_token) for stop_token in stop] + stop_token_ids))
             if "llama" in model_name.lower():
@@ -957,7 +994,7 @@ class HFModel(LLM):
 
         inputs = inputs.to(self.model.device)
         input_len = inputs.input_ids.size(1)
-        if hasattr(self.model, "model") and not self.disable_prefill:
+        if hasattr(self.model, "model") and not self.disable_prefill and not self.is_shadowkv:
             from transformers import BatchEncoding
             # prefill without calculating the logits (save memory for large vocab models)
             # one could also do prefilling by chunks, which would save more memory but is more complex and slower
@@ -967,30 +1004,53 @@ class HFModel(LLM):
                 cache = HybridMambaAttentionDynamicCache(self.model.config, inputs.input_ids.shape[0], self.model.dtype, device=self.model.device)
                 extra = {"past_key_values": cache}
 
-            prefill = self.model.model(input_ids=inputs.input_ids[..., :-1], attention_mask=inputs.attention_mask[..., :-1], **extra)
+            prefill = self.model.model(input_ids=inputs.input_ids[..., :-1], attention_mask=inputs.attention_mask[..., :-1], use_cache=True, **extra)
             past_key_values = prefill.past_key_values
             if past_key_values is None:
                 self.disable_prefill = True
                 logger.warning("past key values is None, not able to prefill with KVs, disabling...")
             else:
                 inputs = BatchEncoding({"input_ids": inputs.input_ids, "attention_mask": inputs.attention_mask, "past_key_values": past_key_values})
+        if self.is_shadowkv:
+            outputs = self.model.generate(
+                inputs.input_ids,
+                gen_len=self.generation_max_length,
+                temperature=self.temperature,
+                top_p=self.top_p,
+            )
+        else:
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=self.generation_max_length,
+                min_new_tokens=self.generation_min_length,
+                do_sample=self.do_sample,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                eos_token_id=self.stop_token_ids,
+                pad_token_id=self.tokenizer.pad_token_id,
+                return_dict_in_generate=True,
+                output_scores=False,
+            )
 
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=self.generation_max_length,
-            min_new_tokens=self.generation_min_length,
-            do_sample=self.do_sample,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            eos_token_id=self.stop_token_ids,
-            pad_token_id=self.tokenizer.pad_token_id,
-            return_dict_in_generate=True,
-            output_scores=False,
-        )
-        text = self.tokenizer.decode(outputs['sequences'][0, input_len:], skip_special_tokens=True)
-
+        if isinstance(outputs, list) and len(outputs) > 0 and isinstance(outputs[0], str):
+            text = outputs[0]
+            prompt_text = self.tokenizer.decode(inputs.input_ids[0], skip_special_tokens=True)
+            if text.strip().startswith(prompt_text.strip()) and len(text) > len(prompt_text):
+                text = text[len(prompt_text):]
+            output_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            output_len = len(output_ids)
+        else:
+            if hasattr(outputs, 'sequences'):
+                sequences = outputs['sequences']
+            else:
+                sequences = outputs
+            if not torch.is_tensor(sequences):
+                sequences = torch.tensor(sequences)
+            text = self.tokenizer.decode(sequences[0, input_len:], skip_special_tokens=True)
+            output_len = sequences.size(1) - input_len
+        
         save_prompt = self.tokenizer.decode(inputs["input_ids"][0][:500]) + " <skip> " + self.tokenizer.decode(inputs["input_ids"][0][-500:])
-        output_len = outputs['sequences'].size(1) - input_len
+        
         # free up some gpu memory
         del inputs
         del outputs
@@ -1255,7 +1315,7 @@ class SGLangModel(LLM):
         ]
 
 
-def load_LLM(args):
+def load_LLM(args, _device):
     kwargs = {}
     if "gpt" in args.model_name_or_path:
         model_cls = OpenAIModel
@@ -1287,7 +1347,7 @@ def load_LLM(args):
         if args.rope_theta is not None:
             kwargs["rope_theta"] = args.rope_theta
 
-    logger.info(f"Loading model {args.model_name_or_path} with {model_cls.__name__}")
+    logger.info(f"Loading model {args.model_name_or_path} with {model_cls.__name__} with {type(model_cls) and type(args)}")
     model = model_cls(
         args.model_name_or_path,
         temperature=args.temperature,
@@ -1296,9 +1356,11 @@ def load_LLM(args):
         generation_max_length=args.generation_max_length,
         generation_min_length=args.generation_min_length,
         do_sample=args.do_sample,
-        stop_newline=args.stop_newline,
+        stop_new_line=args.stop_new_line,
         use_chat_template=args.use_chat_template,
         system_message=args.system_message,
+        _device=_device,
+        model_key=args.model_key,
         **kwargs,
     )
 

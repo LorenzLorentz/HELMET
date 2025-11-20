@@ -195,7 +195,7 @@ def main():
     assert len(test_files) == len(demo_files)
 
     args.input_max_length = max(max_lengths)
-    model = load_LLM(args)
+    model = load_LLM(args, "cuda:0")
 
     for dataset, test_file, demo_file, max_length, gen_length in zip(datasets, test_files, demo_files, max_lengths, gen_lengths):
         args.datasets = dataset

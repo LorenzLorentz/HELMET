@@ -6,6 +6,8 @@ import yaml
 from dataclasses import dataclass, asdict
 from tqdm import tqdm
 
+SEEDS = [0, 42, 3407]
+
 dataset_to_metrics = {
     "json_kv": "substring_exact_match",
     "nq": "substring_exact_match",
@@ -48,6 +50,7 @@ dataset_to_metrics = {
 }
 
 dataset_to_metrics = {k: [v] if isinstance(v, str) else v for k, v in dataset_to_metrics.items()}
+
 custom_avgs = {
     "Recall": ["json_kv substring_exact_match", "ruler_niah_mk_2 ruler_recall", "ruler_niah_mk_3 ruler_recall", "ruler_niah_mv ruler_recall"],
     "RAG": ['nq substring_exact_match', 'hotpotqa substring_exact_match', 'popqa substring_exact_match', 'triviaqa substring_exact_match',],
@@ -91,7 +94,7 @@ class arguments:
                 
     def get_path(self):
         tag = self.tag
-        path = os.path.join(self.output_dir, self.config, "{args.dataset}_{tag}_{args.test_name}_in{args.input_max_length}_size{args.max_test_samples}_shots{args.shots}_samp{args.do_sample}max{args.generation_max_length}min{args.generation_min_length}t{args.temperature}p{args.top_p}_chat{args.use_chat_template}_{args.seed}.json".format(args=self, tag=tag))
+        path = os.path.join(self.output_dir, self.config, "{args.dataset}_{tag}_{args.test_name}_in{args.input_max_length}_size{args.max_test_samples}_shots{args.shots}_samp{args.do_sample}max{args.generation_max_length}min{args.generation_min_length}t{args.temperature}p{args.top_p}_chat{args.use_chat_template}.json_seed{args.seed}.json".format(args=self, tag=tag))
         # print("???", self.config, path)
 
         if os.path.exists(path.replace(".json", "-gpt4eval_o.json")):
@@ -163,6 +166,56 @@ class arguments:
         dfs = df.groupby(list(output[0].keys())[:-1]).mean().reset_index()
 
         return dfs.to_dict("records")
+    
+    def get_multi_seed_metrics(self, seeds=SEEDS):
+        """
+        返回:
+        {
+            metric_name1: [v_seed0, v_seed42, v_seed3407],
+            metric_name2: [...],
+            ...
+        }
+        所有值都已经做过 *100 和 *100/3 的缩放（和原来一致）
+        """
+        dsimple, metric_names = self.get_metric_name()
+        if dsimple is None:
+            return None
+
+        # 为每个 metric_name 准备一个 list
+        scores_by_metric = {m: [] for m in metric_names}
+
+        original_seed = self.seed
+
+        for sd in seeds:
+            self.seed = sd
+            path = self.get_path()
+            if not os.path.exists(path):
+                print(f"path doesn't exist {path}")
+                self.seed = original_seed
+                return None
+
+            with open(path) as f:
+                results = json.load(f)
+
+            # 和原来的 get_averaged_metric 一致的取值逻辑
+            if path.endswith(".score"):
+                base = results
+            else:
+                base = results["averaged_metrics"]
+
+            for m in metric_names:
+                if m not in base:
+                    print("metric doesn't exist", m, "in", path)
+                    self.seed = original_seed
+                    return None
+                v = base[m]
+                # 注意这里的缩放逻辑要和原来完全一致
+                v = v * (100 if m == "gpt-4-f1" else 1) * (100/3 if m == "gpt-4-score" else 1)
+                scores_by_metric[m].append(v)
+
+        self.seed = original_seed
+        return scores_by_metric
+
 
 if __name__ == "__main__":
     # comment out the models you don't want to include, or add the new ones 
@@ -170,14 +223,33 @@ if __name__ == "__main__":
         {"model": "8b_fullattn_sft", "use_chat_template": False, "training_length": 16384},
         {"model": "8b_infllmv2_sft", "use_chat_template": False, "training_length": 16384},
         {"model": "8b_nosa_sft", "use_chat_template": False, "training_length": 16384},
+        
+        {"model": "3b_fullattn_sft", "use_chat_template": False, "training_length": 16384},
+        {"model": "3b_infllmv2_sft", "use_chat_template": False, "training_length": 16384},
+        {"model": "3b_nosa_sft", "use_chat_template": False, "training_length": 16384},
+        
+        {"model": "1b_fullattn_sft", "use_chat_template": False, "training_length": 16384},
+        {"model": "1b_infllmv2_sft", "use_chat_template": False, "training_length": 16384},
+        {"model": "1b_nosa_sft", "use_chat_template": False, "training_length": 16384},
+
+        # {"model": "1b_shadowkv_chunk_size=8", "use_chat_template": False, "training_length": 16384},
+        # {"model": "3b_shadowkv_chunk_size=8", "use_chat_template": False, "training_length": 16384},
+        # {"model": "8b_shadowkv_chunk_size=8", "use_chat_template": False, "training_length": 16384},
+
+        # {"model": "1b_shadowkv_chunk_size=64", "use_chat_template": False, "training_length": 16384},
+        # {"model": "3b_shadowkv_chunk_size=64", "use_chat_template": False, "training_length": 16384},
+        # {"model": "8b_shadowkv_chunk_size=64", "use_chat_template": False, "training_length": 16384},
+
+        # {"model": "1b_infllmv1_64", "use_chat_template": False, "training_length": 16384},
+        # {"model": "3b_infllmv1_64", "use_chat_template": False, "training_length": 16384},
+        # {"model": "8b_infllmv1_64", "use_chat_template": False, "training_length": 16384},
+
+        # {"model": "1b_infllmv1_128", "use_chat_template": False, "training_length": 16384},
+        # {"model": "3b_infllmv1_128", "use_chat_template": False, "training_length": 16384},
+        # {"model": "8b_infllmv1_128", "use_chat_template": False, "training_length": 16384},
+
         # {"model": "llama_3.2_3b", "use_chat_template": False, "training_length": 16384},
         # {"model": "llama_3.2_1b", "use_chat_template": False, "training_length": 16384},
-        # {"model": "3b_fullattn_sft", "use_chat_template": False, "training_length": 16384},
-        # {"model": "3b_infllmv2_sft", "use_chat_template": False, "training_length": 16384},
-        # {"model": "3b_nosa_sft", "use_chat_template": False, "training_length": 16384},
-        # {"model": "1b_fullattn_sft", "use_chat_template": False, "training_length": 16384},
-        # {"model": "1b_infllmv2_sft", "use_chat_template": False, "training_length": 16384},
-        # {"model": "1b_nosa_sft", "use_chat_template": False, "training_length": 16384}
     ]
     _models_configs = [
         {"model": "gpt-4-0125-preview", "use_chat_template": True, "training_length": 128000},
@@ -309,42 +381,80 @@ if __name__ == "__main__":
             )
     print(dataset_configs)    
 
-    failed_paths = []
     df = []
+    failed_paths = []
+
     for model in tqdm(models_configs):
         args = arguments()
-        args.tag = "eval" # SET YOUR TAG HERE
+        args.tag = "eval"  # SET YOUR TAG HERE
         args.output_dir = f"output/{model['model']}"
     
         for dataset in dataset_configs:
-            # args.update(dataset)
             args.update(model)
             args.update(dataset)
 
-            metric = args.get_averaged_metric()
-            dsimple, mnames = args.get_metric_name()
+            get_metric_name_return = args.get_metric_name()
+            if(get_metric_name_return is None):
+                continue
+            dsimple, mnames = get_metric_name_return
+            scores_by_metric = args.get_multi_seed_metrics(SEEDS)
 
-            if metric is None:
+            if scores_by_metric is None:
                 failed_paths.append(args.get_path())
                 continue
-                
-            for k, m in metric.items():
-                df.append({**asdict(args), **model,
-                    "metric name": k, "metric": m, 
-                    "dataset_simple": dsimple + " " + k, "test_data": f"{args.dataset}-{args.test_name}-{args.input_max_length}"
-                })
+
+            for k in mnames:
+                vals = np.array(scores_by_metric[k], dtype=float)
+                row = {
+                    **asdict(args),
+                    **model,
+                    "metric name": k,
+                    # 各个 seed 的原始值（方便你以后看）
+                    "metric_seed_0": float(vals[0]),
+                    "metric_seed_42": float(vals[1]),
+                    "metric_seed_3407": float(vals[2]),
+                    # 三次的均值 & 标准差
+                    "metric": float(vals.mean()),       # 这里沿用原来列名 metric = mean
+                    "metric_std": float(vals.std()),
+                    "dataset_simple": dsimple + " " + k,
+                    "test_data": f"{args.dataset}-{args.test_name}-{args.input_max_length}",
+                }
+                df.append(row)
+
 
     all_df = pd.DataFrame(df)
-    lf_df = all_df.pivot_table(index=["input_max_length", "model", ], columns="dataset_simple", values="metric", sort=False)
-    lf_df = lf_df.reset_index()
-    print(lf_df.to_csv(index=False), file=open("test1.csv", "w"))
+    with open("result_all_tmp.csv", "w") as f:
+        print(all_df.to_csv(index=False), file=f)
 
+    # 1) 按 mean pivot（和原来一致）
+    lf_mean = all_df.pivot_table(
+        index=["input_max_length", "model"],
+        columns="dataset_simple",
+        values="metric",
+        sort=False
+    ).reset_index()
+
+    print(lf_mean.to_csv(index=False), file=open("test1_mean.csv", "w"))
+
+    # 2) 按 std pivot
+    lf_std = all_df.pivot_table(
+        index=["input_max_length", "model"],
+        columns="dataset_simple",
+        values="metric_std",
+        sort=False
+    ).reset_index()
+
+    print(lf_std.to_csv(index=False), file=open("test1_std.csv", "w"))
+
+    # 3) 对于 custom_avgs，目前先只对 mean 做（和原来保持一致）
     for k, v in custom_avgs.items():
-        lf_df[k] = lf_df[v].mean(axis=1)
-    lf_df = lf_df[["model"] + list(custom_avgs.keys())]
+        lf_mean[k] = lf_mean[v].mean(axis=1)
 
-    with open("result_8b.csv", "w") as f:
-        print(lf_df.to_csv(index=False), file=f)
+    lf_mean_out = lf_mean[["model"] + list(custom_avgs.keys())]
+
+    with open("result_all.csv", "w") as f:
+        print(lf_mean_out.to_csv(index=False), file=f)
+
 
     print("Warning, failed to get the following paths, make sure that these are correct or the printed results will not be accurate:", failed_paths)
     # import pdb; pdb.set_trace()
